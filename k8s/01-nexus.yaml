@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nexus
+---
+# LAB ONLY: single-node local PV, no failover across nodes.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nexus-local-pv
+spec:
+  capacity:
+    storage: 30Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nexus-local
+  volumeMode: Filesystem
+  local:
+    path: /srv/nexus-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values: [worker1]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nexus-data
+  namespace: nexus
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: nexus-local
+  volumeName: nexus-local-pv
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexus
+  namespace: nexus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: nexus}
+  template:
+    metadata:
+      labels: {app: nexus}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker1
+      imagePullSecrets:
+      - name: nexus-registry-secret
+      terminationGracePeriodSeconds: 150
+      containers:
+      - name: nexus
+        image: repo-sec.nexus.local:31920/sonatype/nexus3:3.98.1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: web
+          containerPort: 8081
+        startupProbe:
+          tcpSocket: {port: 8081}
+          failureThreshold: 60
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          failureThreshold: 6
+        resources:
+          requests: {cpu: 500m, memory: 2Gi}
+          limits: {cpu: '4', memory: 6Gi}
+        volumeMounts:
+        - {name: nexus-data, mountPath: /nexus-data}
+      volumes:
+      - name: nexus-data
+        persistentVolumeClaim:
+          claimName: nexus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus
+  namespace: nexus
+spec:
+  selector: {app: nexus}
+  ports:
+  - {name: http, port: 8081, targetPort: 8081}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nexus-security
+  namespace: nexus
+spec:
+  secretName: nexus-security-tls
+  dnsNames:
+  - nexus.security.local
+  issuerRef:
+    kind: ClusterIssuer
+    name: cluster-ca-issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nexus
+  namespace: nexus
+  annotations:
+    nginx.org/ssl-redirect: 'true'
+    nginx.org/client-max-body-size: '2g'
+    nginx.org/proxy-read-timeout: '300s'
+    nginx.org/proxy-send-timeout: '300s'
+spec:
+  ingressClassName: nginx-f5
+  tls:
+  - hosts: [nexus.security.local]
+    secretName: nexus-security-tls
+  rules:
+  - host: nexus.security.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nexus
+            port: {number: 8081}
